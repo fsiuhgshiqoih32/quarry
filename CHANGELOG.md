@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- The window now opens on machines without OpenGL 2 (many virtual machines, remote desktops and
+  PCs without GPU drivers): Quarry falls back to wgpu, using Direct3D 12 with a software adapter
+  on Windows when there's no GPU. `QUARRY_RENDERER=wgpu` skips the OpenGL attempt.
+- Linux: the `.deb` now depends on `libxkbcommon-x11-0`, which the window needs.
+
 ## 0.1.0
 
 First release.
