@@ -43,11 +43,13 @@ fn build() -> Result<TrayIcon, String> {
     .map_err(|e| e.to_string())?;
     let builder = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Quarry");
     #[cfg(target_os = "macos")]
-    let builder = builder.with_icon_as_template(true);
+    let builder = builder.with_icon_templated(icon()?);
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.with_icon(icon()?);
     // On Windows a left click opens the window; the menu stays on the right button.
     #[cfg(windows)]
     let builder = builder.with_menu_on_left_click(false);
-    builder.with_icon(icon()?).build().map_err(|e| e.to_string())
+    builder.build().map_err(|e| e.to_string())
 }
 
 fn route(handler: Handler) {

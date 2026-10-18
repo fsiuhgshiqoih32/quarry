@@ -2,7 +2,9 @@
 //! egui never sees a "show" command sent while it is hidden; these calls go to the OS directly.
 
 use eframe::egui;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use raw_window_handle::HasWindowHandle;
+#[cfg(any(windows, target_os = "macos"))]
+use raw_window_handle::RawWindowHandle;
 
 pub struct Native {
     #[cfg(windows)]
