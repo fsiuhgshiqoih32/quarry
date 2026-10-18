@@ -82,28 +82,72 @@ pub fn run(launch: Launch) -> Result<(), String> {
         let cfg = Config::load(&path);
         (path, config::index_path(), cfg, listener)
     };
+    let smoke = launch.smoke_test;
+    // Held until a renderer starts, so a failed attempt can hand everything to the next one.
+    let init = Arc::new(Mutex::new(Some((cfg, cfg_path, index_path, listener, launch))));
+    let mut failures = Vec::new();
+    // OpenGL is the lighter renderer. Virtual machines, remote desktops and machines without GPU
+    // drivers often lack OpenGL 2, so fall back to wgpu (Direct3D 12 with its software adapter on
+    // Windows, Metal on macOS, Vulkan or GL elsewhere).
+    // QUARRY_RENDERER=wgpu tries wgpu first.
+    let mut order = [eframe::Renderer::Glow, eframe::Renderer::Wgpu];
+    if std::env::var("QUARRY_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("wgpu")) {
+        order.reverse();
+    }
+    for renderer in order {
+        let slot = init.clone();
+        let result = eframe::run_native(
+            "Quarry",
+            native_options(renderer, !smoke),
+            Box::new(move |cc| {
+                let (cfg, cfg_path, index_path, listener, launch) = slot.lock().take().ok_or("already started")?;
+                Ok(Box::new(App::new(cc, cfg, cfg_path, index_path, listener, launch)))
+            }),
+        );
+        match result {
+            Ok(()) => {
+                if smoke && SMOKE_FAILED.load(Ordering::Relaxed) {
+                    return Err("GUI smoke test did not find its file".into());
+                }
+                return Ok(());
+            }
+            // The app started and then failed: don't start it twice.
+            Err(e) if init.lock().is_none() => return Err(e.to_string()),
+            Err(e) => {
+                eprintln!("quarry: the {renderer} renderer is unavailable ({e})");
+                failures.push(format!("{renderer}: {e}"));
+            }
+        }
+    }
+    Err(format!("could not open a window: {}", failures.join("; ")))
+}
+
+fn native_options(renderer: eframe::Renderer, persist: bool) -> eframe::NativeOptions {
     let icon = egui::IconData { rgba: quarry::art::app_icon(64), width: 64, height: 64 };
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Quarry")
             .with_app_id("quarry")
             .with_inner_size([1000.0, 640.0])
             .with_min_inner_size([560.0, 320.0])
             .with_icon(icon),
-        persist_window: !launch.smoke_test,
+        persist_window: persist,
+        renderer,
         ..Default::default()
     };
-    let smoke = launch.smoke_test;
-    eframe::run_native(
-        "Quarry",
-        options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, cfg, cfg_path, index_path, listener, launch)))),
-    )
-    .map_err(|e| e.to_string())?;
-    if smoke && SMOKE_FAILED.load(Ordering::Relaxed) {
-        return Err("GUI smoke test did not find its file".into());
-    }
-    Ok(())
+    // Prefer a real GPU, but take a software adapter (WARP, llvmpipe) rather than no window at all.
+    let setup = eframe::egui_wgpu::WgpuSetupCreateNew {
+        native_adapter_selector: Some(Arc::new(|adapters: &[eframe::wgpu::Adapter], _surface| {
+            let pick = adapters
+                .iter()
+                .find(|a| a.get_info().device_type != eframe::wgpu::DeviceType::Cpu)
+                .or_else(|| adapters.first());
+            pick.cloned().ok_or_else(|| "no graphics adapter".to_string())
+        })),
+        ..Default::default()
+    };
+    options.wgpu_options.wgpu_setup = eframe::egui_wgpu::WgpuSetup::CreateNew(setup);
+    options
 }
 
 /// What a result row shows, cached so rows can be drawn while the index is locked for writing.

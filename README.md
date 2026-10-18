@@ -38,8 +38,8 @@ launches start from the saved index straight away.
 Give it Full Disk Access (System Settings > Privacy & Security) to see Mail, Messages and other
 protected folders; without it those folders are just left out.
 
-**Linux:** the tray icon needs GTK 3 and `libayatana-appindicator3` (installed on most desktops).
-The `.deb` pulls them in. The global shortcut works on X11; on Wayland, bind your desktop's own
+**Linux:** the tray icon needs GTK 3 and `libayatana-appindicator3`, and the window needs
+`libxkbcommon-x11` (all installed on most desktops). The `.deb` pulls them in. The global shortcut works on X11; on Wayland, bind your desktop's own
 shortcut to `quarry` instead (a second launch brings the running window forward).
 
 ## Search syntax
@@ -137,6 +137,10 @@ Memory use is roughly 110 bytes per file, so about 110 MB per million files (5.4
 | Index | `%LOCALAPPDATA%\quarry\index.bin` | `~/Library/Caches/quarry/index.bin` | `~/.cache/quarry/index.bin` |
 
 Set `QUARRY_HOME` to keep both in one folder instead (for a portable copy, say).
+
+The window draws with OpenGL and falls back to wgpu (Direct3D 12, Metal or Vulkan, with a software
+adapter if there's no GPU) when OpenGL 2 isn't available, as in many virtual machines and remote
+desktops. Set `QUARRY_RENDERER=wgpu` to skip the OpenGL attempt.
 
 ## Building
 

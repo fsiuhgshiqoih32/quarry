@@ -23,7 +23,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4.6", features = ["derive"] }
 crossbeam-channel = "0.5"
 dirs = "7"
-eframe = { version = "0.33.3", features = ["persistence"] }
+eframe = { version = "0.33.3", features = ["persistence", "wgpu"] }
 egui_extras = "0.33.3"
 global-hotkey = "0.9"
 memchr = "2.8"
@@ -67,8 +67,9 @@ png = "0.18"
 maintainer = "fsiuhgshiqoih32 <fsiuhgshiqoih32@users.noreply.github.com>"
 copyright = "2026 fsiuhgshiqoih32"
 extended-description = """Type part of a file name and every matching file and folder on the system shows up as you type, with Everything-style search syntax, live index updates, a tray icon, a command-line interface and a local HTTP API."""
-# The tray loads libayatana-appindicator at run time, so it isn't found by $auto.
-depends = "$auto, libayatana-appindicator3-1"
+# The tray loads libayatana-appindicator and winit loads libxkbcommon-x11 at run time, so $auto
+# doesn't find them.
+depends = "$auto, libayatana-appindicator3-1, libxkbcommon-x11-0"
 section = "utils"
 priority = "optional"
 assets = [
