@@ -1,0 +1,84 @@
+[package]
+name = "quarry"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+default-run = "quarry"
+description = "Instant file search for Windows, macOS and Linux, with Everything-style search syntax."
+license = "MIT"
+repository = "https://github.com/fsiuhgshiqoih32/quarry"
+readme = "README.md"
+keywords = ["search", "files", "everything", "desktop", "finder"]
+categories = ["filesystem", "command-line-utilities", "gui"]
+
+[features]
+default = ["tray"]
+# Tray icon. On Linux this needs GTK 3 and libayatana-appindicator at build and run time;
+# build with --no-default-features for a binary without one.
+tray = ["dep:tray-icon", "dep:gtk"]
+
+[dependencies]
+auto-launch = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6", features = ["derive"] }
+crossbeam-channel = "0.5"
+dirs = "7"
+eframe = { version = "0.33.3", features = ["persistence"] }
+egui_extras = "0.33.3"
+global-hotkey = "0.9"
+memchr = "2.8"
+notify = "8"
+opener = { version = "0.8", features = ["reveal"] }
+parking_lot = "0.12"
+raw-window-handle = "0.6"
+rayon = "1.12"
+regex = "1.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+toml = "1"
+tray-icon = { version = "0.26", optional = true }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+drag = "2.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+png = "0.18"
+
+[package.metadata.deb]
+maintainer = "fsiuhgshiqoih32 <fsiuhgshiqoih32@users.noreply.github.com>"
+copyright = "2026 fsiuhgshiqoih32"
+extended-description = """Type part of a file name and every matching file and folder on the system shows up as you type, with Everything-style search syntax, live index updates, a tray icon, a command-line interface and a local HTTP API."""
+# The tray loads libayatana-appindicator at run time, so it isn't found by $auto.
+depends = "$auto, libayatana-appindicator3-1"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/quarry", "usr/bin/", "755"],
+    ["packaging/linux/quarry.desktop", "usr/share/applications/", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/512x512/apps/quarry.png", "644"],
+    ["README.md", "usr/share/doc/quarry/README.md", "644"],
+]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

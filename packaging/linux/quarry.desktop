@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Quarry
+GenericName=File Search
+Comment=Find files and folders by name as you type
+Exec=quarry
+Icon=quarry
+Terminal=false
+Categories=Utility;FileTools;System;
+Keywords=search;find;files;everything;locate;
+StartupWMClass=quarry
