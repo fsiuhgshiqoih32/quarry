@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
-Engine work merged from Scry, a sibling Everything clone.
+This release merges in the engine from Scry, a sibling Everything-style search tool.
 
 - Start-up brings the saved index up to date in place, folder by folder, instead of building a
   second index: searchable throughout, about a third of the peak memory, and quitting part-way
