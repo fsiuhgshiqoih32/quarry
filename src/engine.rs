@@ -369,7 +369,7 @@ pub fn apply(shared: &Shared, ex: &Excludes, paths: Vec<PathBuf>) {
                 Ok(md) => {
                     let meta = scan::meta_from(&md, &name);
                     let is_dir = meta.flags & DIR != 0;
-                    let kids = |p: &Path| if is_dir { scan::scan_dir(p, ex, &quiet) } else { Vec::new() };
+                    let kids = |p: &Path| if is_dir { scan::scan_dir(p, ex, &quiet, &|_| {}) } else { Vec::new() };
                     match existing {
                         Some(id) if ix.entry(id).is_dir() == is_dir && ix.name(id) == name => {
                             ops.push(Op::Update(id, meta))

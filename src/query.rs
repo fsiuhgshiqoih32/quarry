@@ -215,6 +215,7 @@ impl Query {
             return false;
         }
         scratch.id = u32::MAX;
+        scratch.name_id = u32::MAX;
         self.eval(&self.root, ix, id, e, scratch)
     }
 
@@ -246,7 +247,18 @@ impl Query {
             }
             (&s.path, &s.folded)
         } else {
-            (ix.name(id), ix.folded_name(id))
+            let name = ix.name(id);
+            // Only a case-insensitive substring search needs the whole name folded.
+            if matches!(&l.test, Test::Substr { case: false, unicode: None, .. }) {
+                if s.name_id != id {
+                    s.name_folded.clear();
+                    s.name_folded.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
+                    s.name_id = id;
+                }
+                (name, &s.name_folded)
+            } else {
+                (name, name.as_bytes())
+            }
         };
         match &l.test {
             Test::Substr { finder, case, unicode, whole_word } => {
@@ -261,16 +273,28 @@ impl Query {
                 let hay = if *case { orig.as_bytes() } else { folded };
                 if *whole_word { find_word(hay, finder.needle()) } else { finder.find(hay).is_some() }
             }
-            Test::Prefix { needle, case } => (if *case { orig.as_bytes() } else { folded }).starts_with(needle),
-            Test::Suffix { needle, case } => (if *case { orig.as_bytes() } else { folded }).ends_with(needle),
+            Test::Prefix { needle, case } => {
+                let h = orig.as_bytes();
+                h.len() >= needle.len() && {
+                    let head = &h[..needle.len()];
+                    if *case { head == needle.as_slice() } else { head.eq_ignore_ascii_case(needle) }
+                }
+            }
+            Test::Suffix { needle, case } => {
+                let h = orig.as_bytes();
+                h.len() >= needle.len() && {
+                    let tail = &h[h.len() - needle.len()..];
+                    if *case { tail == needle.as_slice() } else { tail.eq_ignore_ascii_case(needle) }
+                }
+            }
             Test::Regex(re) => re.is_match(orig),
             Test::Ext(exts) => {
-                let name = ix.folded_name(id);
+                let name = ix.name(id).as_bytes();
                 let ext: &[u8] = match memchr::memrchr(b'.', name) {
                     Some(p) => &name[p + 1..],
                     None => b"",
                 };
-                exts.iter().any(|x| x.as_slice() == ext)
+                exts.iter().any(|x| x.eq_ignore_ascii_case(ext))
             }
             _ => unreachable!(),
         }
@@ -282,11 +306,13 @@ pub struct Scratch {
     id: u32,
     path: String,
     folded: Vec<u8>,
+    name_id: u32,
+    name_folded: Vec<u8>,
 }
 
 impl Default for Scratch {
     fn default() -> Self {
-        Scratch { id: u32::MAX, path: String::new(), folded: Vec::new() }
+        Scratch { id: u32::MAX, path: String::new(), folded: Vec::new(), name_id: u32::MAX, name_folded: Vec::new() }
     }
 }
 

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use parking_lot::RwLock;
 use rayon::prelude::*;
 
 use crate::index::{CASE_INSENSITIVE_FS, DIR, HIDDEN, Index, Meta, SYMLINK};
@@ -264,8 +265,12 @@ fn list(path: &Path) -> Option<Vec<(String, Meta)>> {
     Some(out)
 }
 
-/// Reads one folder and, in parallel, everything below it.
-pub fn scan_dir(path: &Path, ex: &Excludes, progress: &Progress) -> Vec<Node> {
+/// Called with every folder a scan lists; the Linux watcher adds its watches this way.
+pub type OnDir<'a> = &'a (dyn Fn(&Path) + Sync);
+
+/// Reads one folder and, in parallel, everything below it. Live updates use this for folders
+/// that appear while Quarry runs.
+pub fn scan_dir(path: &Path, ex: &Excludes, progress: &Progress, on_dir: OnDir) -> Vec<Node> {
     if progress.cancelled() {
         return Vec::new();
     }
@@ -273,6 +278,7 @@ pub fn scan_dir(path: &Path, ex: &Excludes, progress: &Progress) -> Vec<Node> {
         progress.unreadable.fetch_add(1, Ordering::Relaxed);
         return Vec::new();
     };
+    on_dir(path);
     let mut nodes = Vec::with_capacity(listing.len());
     let mut dirs: Vec<(PathBuf, usize)> = Vec::new();
     for (name, meta) in listing {
@@ -287,7 +293,7 @@ pub fn scan_dir(path: &Path, ex: &Excludes, progress: &Progress) -> Vec<Node> {
     }
     progress.items.fetch_add(nodes.len() as u64, Ordering::Relaxed);
     let subtrees: Vec<(usize, Vec<Node>)> =
-        dirs.into_par_iter().map(|(p, at)| (at, scan_dir(&p, ex, progress))).collect();
+        dirs.into_par_iter().map(|(p, at)| (at, scan_dir(&p, ex, progress, on_dir))).collect();
     for (at, kids) in subtrees {
         nodes[at].kids = kids;
     }
@@ -325,26 +331,207 @@ pub fn root_name(p: &Path) -> String {
 
 /// Scans every root and returns the finished index.
 pub fn scan(roots: &[PathBuf], ex: &Excludes, progress: &Progress) -> Index {
-    let roots = dedup_roots(roots);
-    let trees: Vec<(String, Meta, Vec<Node>)> = roots
-        .par_iter()
-        .filter_map(|r| {
-            let md = fs::metadata(r).ok()?;
-            if !md.is_dir() {
-                return None;
-            }
-            let name = root_name(r);
-            let meta = Meta { flags: DIR, size: 0, mtime: secs(md.modified()) };
-            Some((name, meta, scan_dir(r, ex, progress)))
-        })
-        .collect();
+    scan_with(roots, ex, progress, &|_| {})
+}
+
+/// How many folders to list at once. Listing is mostly waiting on the file system, so a few more
+/// threads than cores keeps the disk busy.
+fn lister_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(4, 16)
+}
+
+/// Scans every root. Listing threads hand each folder to one thread that appends it to the index
+/// straight away, so no copy of the tree is held in between. Folders are added before their
+/// contents, which keeps every parent id smaller than its children's.
+pub fn scan_with(roots: &[PathBuf], ex: &Excludes, progress: &Progress, on_dir: OnDir) -> Index {
     let mut ix = Index::new();
-    for (name, meta, kids) in trees {
-        let id = ix.add_root(&name, meta);
-        insert(&mut ix, id, kids);
+    let mut start = Vec::new();
+    for r in dedup_roots(roots) {
+        let Ok(md) = fs::metadata(&r) else { continue };
+        if !md.is_dir() {
+            continue;
+        }
+        let id = ix.add_root(&root_name(&r), Meta { flags: DIR, size: 0, mtime: secs(md.modified()) });
+        start.push((id, r));
     }
+    walk(start, progress, on_dir, |dir, path, listing, next, _| {
+        for (name, meta) in listing {
+            if meta.flags & DIR != 0 {
+                let p = path.join(&name);
+                if ex.skip_dir(&p, &name) {
+                    continue;
+                }
+                let id = ix.add(dir, &name, meta);
+                next.push((id, p));
+            } else {
+                ix.add(dir, &name, meta);
+            }
+        }
+        progress.items.store(ix.live_count() as u64, Ordering::Relaxed);
+    });
     ix.finish_bulk();
     ix
+}
+
+/// A folder to list: its id in the index and its path.
+pub type Job = (u32, PathBuf);
+
+/// Lists folders on a pool of threads and hands each listing, in arrival order, to `apply` on
+/// the calling thread, which queues the subfolders to list next. `apply` also gets the number of
+/// folders still being listed. Stops early if cancelled.
+fn walk(
+    start: Vec<Job>,
+    progress: &Progress,
+    on_dir: OnDir,
+    mut apply: impl FnMut(u32, &Path, Vec<(String, Meta)>, &mut Vec<Job>, usize),
+) {
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+    let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u32, PathBuf, Option<Vec<(String, Meta)>>)>();
+    std::thread::scope(|s| {
+        for _ in 0..lister_threads() {
+            let (job_rx, res_tx) = (job_rx.clone(), res_tx.clone());
+            s.spawn(move || {
+                for (dir, path) in job_rx {
+                    let listing = if progress.cancelled() { None } else { list(&path) };
+                    if listing.is_some() {
+                        on_dir(&path);
+                    }
+                    if res_tx.send((dir, path, listing)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(res_tx);
+        let mut pending = 0usize;
+        for job in start {
+            if job_tx.send(job).is_ok() {
+                pending += 1;
+            }
+        }
+        let mut next = Vec::new();
+        while pending > 0 {
+            let Ok((dir, path, listing)) = res_rx.recv() else { break };
+            pending -= 1;
+            if progress.cancelled() {
+                continue;
+            }
+            let Some(listing) = listing else {
+                progress.unreadable.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            apply(dir, &path, listing, &mut next, pending);
+            for job in next.drain(..) {
+                if job_tx.send(job).is_ok() {
+                    pending += 1;
+                }
+            }
+        }
+        drop(job_tx);
+    });
+}
+
+/// Brings part of an existing index up to date in place: lists every folder below `start` and
+/// patches the index where it differs, keeping it searchable throughout. Work done before a
+/// cancel is kept. `tick` runs every second or so with the lock released. Returns false if
+/// cancelled.
+pub fn refresh(
+    lock: &RwLock<Index>,
+    start: Vec<Job>,
+    ex: &Excludes,
+    progress: &Progress,
+    on_dir: OnDir,
+    tick: &dyn Fn(),
+) -> bool {
+    // Several listings are applied per write lock, so searches wait less often.
+    let mut batch: Vec<(u32, PathBuf, Vec<(String, Meta)>)> = Vec::new();
+    let mut last_tick = std::time::Instant::now();
+    let mut flush = |batch: &mut Vec<(u32, PathBuf, Vec<(String, Meta)>)>, next: &mut Vec<Job>, force: bool| {
+        if batch.is_empty() || (!force && batch.len() < 64) {
+            return;
+        }
+        let mut ix = lock.write();
+        for (dir, path, listing) in batch.drain(..) {
+            if (dir as usize) < ix.len() && !ix.entry(dir).is_deleted() {
+                patch_folder(&mut ix, ex, dir, &path, listing, next);
+            }
+        }
+        if last_tick.elapsed() >= std::time::Duration::from_secs(1) {
+            ix.merge_pending();
+            drop(ix);
+            tick();
+            last_tick = std::time::Instant::now();
+        }
+    };
+    // Subfolders of a held listing are only queued once it is applied, so apply at once whenever
+    // the listing threads are about to run out of work.
+    let low = lister_threads() * 2;
+    walk(start, progress, on_dir, |dir, path, listing, next, in_flight| {
+        progress.items.fetch_add(listing.len() as u64, Ordering::Relaxed);
+        batch.push((dir, path.to_path_buf(), listing));
+        flush(&mut batch, next, in_flight < low);
+    });
+    let mut ix = lock.write();
+    for (dir, path, listing) in batch.drain(..) {
+        if (dir as usize) < ix.len() && !ix.entry(dir).is_deleted() {
+            patch_folder(&mut ix, ex, dir, &path, listing, &mut Vec::new());
+        }
+    }
+    ix.merge_pending();
+    drop(ix);
+    tick();
+    !progress.cancelled()
+}
+
+/// Makes one folder's children in the index match a fresh listing, and queues its subfolders.
+fn patch_folder(
+    ix: &mut Index,
+    ex: &Excludes,
+    dir: u32,
+    path: &Path,
+    listing: Vec<(String, Meta)>,
+    next: &mut Vec<Job>,
+) {
+    let mut existing: std::collections::HashMap<String, u32> =
+        ix.children(dir).map(|c| (ix.name(c).to_string(), c)).collect();
+    for (name, meta) in listing {
+        let is_dir = meta.flags & DIR != 0;
+        let child = if is_dir { Some(path.join(&name)) } else { None };
+        if let Some(c) = &child
+            && ex.skip_dir(c, &name)
+        {
+            continue; // left in `existing`, so removed below if it was indexed
+        }
+        let kind = DIR | SYMLINK;
+        let id = match existing.remove(&name) {
+            Some(id) if ix.entry(id).flags & kind == meta.flags & kind => {
+                let e = ix.entry(id);
+                if e.mtime() != meta.mtime || (!is_dir && e.size != meta.size) {
+                    ix.update(id, meta.size, meta.mtime);
+                }
+                id
+            }
+            Some(id) => {
+                ix.remove(id);
+                add_entry(ix, dir, &name, meta)
+            }
+            None => add_entry(ix, dir, &name, meta),
+        };
+        if let Some(c) = child {
+            next.push((id, c));
+        }
+    }
+    let gone: Vec<u32> = existing.into_values().collect();
+    ix.remove_many(dir, &gone);
+}
+
+/// Adds one entry and counts its size in the folders above it.
+fn add_entry(ix: &mut Index, parent: u32, name: &str, meta: Meta) -> u32 {
+    let id = ix.add(parent, name, meta);
+    if meta.flags & DIR == 0 && meta.size > 0 {
+        ix.add_size(parent, meta.size as i64);
+    }
+    id
 }
 
 /// Adds scanned nodes below `parent`, depth first so parents keep smaller ids than their children.
@@ -400,6 +587,46 @@ mod tests {
         assert!(!ex.covers(Path::new("/data/skipped.txt")));
         assert_eq!(root_name(Path::new("C:\\")), "C:\\");
         assert_eq!(root_name(Path::new("/home/u/")), "/home/u");
+    }
+
+    #[test]
+    fn refresh_patches_in_place() {
+        let dir = std::env::temp_dir().join(format!("quarry-refresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::create_dir_all(dir.join("big")).unwrap();
+        fs::write(dir.join("a/one.txt"), b"12345").unwrap();
+        fs::write(dir.join("a/b/two.txt"), b"123").unwrap();
+        for i in 0..300 {
+            fs::write(dir.join(format!("big/f{i}.tmp")), b"x").unwrap();
+        }
+        let lock = RwLock::new(scan(std::slice::from_ref(&dir), &Excludes::default(), &Progress::default()));
+        assert_eq!(lock.read().live_count(), 306);
+        let epoch = lock.read().epoch;
+
+        fs::remove_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/one.txt"), b"1234567890").unwrap();
+        fs::create_dir_all(dir.join("new/deeper")).unwrap();
+        fs::write(dir.join("new/deeper/three.txt"), b"1").unwrap();
+        for i in 0..300 {
+            fs::remove_file(dir.join(format!("big/f{i}.tmp"))).unwrap();
+        }
+
+        let root = lock.read().roots()[0];
+        let done =
+            refresh(&lock, vec![(root, dir.clone())], &Excludes::default(), &Progress::default(), &|_| {}, &|| {});
+        assert!(done);
+        let ix = lock.read();
+        assert_eq!(ix.epoch, epoch, "ids stay valid");
+        assert!(ix.lookup(&dir.join("a").join("b")).is_none());
+        assert!(ix.lookup(&dir.join("new").join("deeper").join("three.txt")).is_some());
+        assert!(ix.children(ix.lookup(&dir.join("big")).unwrap()).next().is_none());
+        assert_eq!(ix.live_count(), 7);
+        assert_eq!(ix.entry(ix.lookup(&dir.join("a").join("one.txt")).unwrap()).size, 10);
+        assert_eq!(ix.entry(root).size, 11);
+        assert_eq!(ix.by_name().len(), ix.live_count());
+        drop(ix);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

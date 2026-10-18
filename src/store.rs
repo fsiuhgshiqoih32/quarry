@@ -5,10 +5,10 @@
 //! Tombstones are dropped on the way out.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::index::{DELETED, Index, NONE};
+use crate::index::{DELETED, Index, Loader, NONE};
 
 const MAGIC: &[u8; 8] = b"QUARRYIX";
 const VERSION: u32 = 1;
@@ -65,10 +65,12 @@ pub fn save(ix: &Index, path: &Path, fingerprint: u64) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
-/// Loads a saved index if it exists, is intact, and was built with the same settings.
+/// Loads a saved index if it exists, is intact, and was built with the same settings. Reads the
+/// file in a stream straight into the index, so loading costs no more memory than the result.
 pub fn load(path: &Path, fingerprint: u64) -> Option<Index> {
-    let data = std::fs::read(path).ok()?;
-    match parse(&data, fingerprint) {
+    let file = File::open(path).ok()?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    match parse(BufReader::with_capacity(1 << 20, file), len, fingerprint) {
         Ok(ix) => Some(ix),
         Err(e) => {
             eprintln!("quarry: not using saved index ({e})");
@@ -77,63 +79,49 @@ pub fn load(path: &Path, fingerprint: u64) -> Option<Index> {
     }
 }
 
-struct Cursor<'a> {
-    data: &'a [u8],
-    pos: usize,
+fn read<const N: usize>(r: &mut impl Read) -> Result<[u8; N], String> {
+    let mut b = [0u8; N];
+    r.read_exact(&mut b).map_err(|_| "truncated")?;
+    Ok(b)
 }
 
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self.pos.checked_add(n).ok_or("truncated")?;
-        let s = self.data.get(self.pos..end).ok_or("truncated")?;
-        self.pos = end;
-        Ok(s)
-    }
-    fn u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-    fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-}
-
-fn parse(data: &[u8], fingerprint: u64) -> Result<Index, String> {
-    let mut c = Cursor { data, pos: 0 };
-    if c.take(8)? != MAGIC {
+/// `len` is the file size, used to reject impossible counts before allocating for them.
+fn parse(mut r: impl Read, len: u64, fingerprint: u64) -> Result<Index, String> {
+    if &read::<8>(&mut r)? != MAGIC {
         return Err("not an index file".into());
     }
-    if c.u32()? != VERSION {
+    if u32::from_le_bytes(read(&mut r)?) != VERSION {
         return Err("index from another version".into());
     }
-    if c.u64()? != fingerprint {
+    if u64::from_le_bytes(read(&mut r)?) != fingerprint {
         return Err("settings changed".into());
     }
-    let count = c.u32()? as usize;
-    let names_len = c.u64()? as usize;
-    if count.checked_mul(RECORD + 4).is_none_or(|n| n > data.len()) || names_len > data.len() {
+    let count = u32::from_le_bytes(read(&mut r)?) as u64;
+    let names_len = u64::from_le_bytes(read(&mut r)?);
+    if count * (RECORD as u64 + 4) + names_len > len {
         return Err("truncated".into());
     }
-    let mut records = Vec::with_capacity(count);
+    let mut loader = Loader::with_capacity(count as usize);
     for _ in 0..count {
-        let len = c.u16()?;
-        let flags = c.u16()?;
-        let parent = c.u32()?;
-        let size = c.u64()?;
-        let mtime = c.u64()? as i64;
-        records.push((len, flags, parent, size, mtime));
+        let rec: [u8; RECORD] = read(&mut r)?;
+        let len = u16::from_le_bytes([rec[0], rec[1]]);
+        let flags = u16::from_le_bytes([rec[2], rec[3]]);
+        let parent = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+        let size = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+        let mtime = i64::from_le_bytes(rec[16..24].try_into().unwrap());
+        loader.push(len, flags, parent, size, mtime)?;
     }
-    let names = String::from_utf8(c.take(names_len)?.to_vec()).map_err(|_| "corrupt names")?;
-    let mut by_name = Vec::with_capacity(count);
+    let mut names = vec![0u8; names_len as usize];
+    r.read_exact(&mut names).map_err(|_| "truncated")?;
+    let names = String::from_utf8(names).map_err(|_| "corrupt names")?;
+    let mut by_name = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        by_name.push(c.u32()?);
+        by_name.push(u32::from_le_bytes(read(&mut r)?));
     }
-    if c.pos != data.len() {
+    if r.read(&mut [0u8; 1]).map_err(|e| e.to_string())? != 0 {
         return Err("trailing data".into());
     }
-    Index::from_parts(records, names, by_name)
+    loader.finish(names, by_name)
 }
 
 #[cfg(test)]
@@ -167,7 +155,7 @@ mod tests {
 
     #[test]
     fn rejects_garbage() {
-        assert!(parse(b"QUARRYIX\x01\0\0\0", 0).is_err());
-        assert!(parse(b"nope", 0).is_err());
+        assert!(parse(&b"QUARRYIX\x01\0\0\0"[..], 12, 0).is_err());
+        assert!(parse(&b"nope"[..], 4, 0).is_err());
     }
 }
