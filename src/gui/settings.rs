@@ -146,12 +146,15 @@ pub fn window(ctx: &egui::Context, open: &mut bool, st: &mut State, cfg: &Config
                 ui.checkbox(&mut next.live_updates, "Follow changes as they happen");
                 if cfg!(target_os = "linux") {
                     ui.label(
-                        RichText::new("On Linux live updates cover your home folder; rescans cover the rest.").weak(),
+                        RichText::new(
+                            "On Linux each folder needs an inotify watch. If the system limit runs out,                              the folders without one are refreshed hourly.",
+                        )
+                        .weak(),
                     );
                 }
-                ui.checkbox(&mut next.rescan_on_start, "Rescan when Quarry starts");
+                ui.checkbox(&mut next.rescan_on_start, "Catch up with changes when Quarry starts");
                 ui.horizontal(|ui| {
-                    ui.label("Full rescan every");
+                    ui.label("Refresh every");
                     ui.add(DragValue::new(&mut st.rescan_minutes).range(0..=10_080).suffix(" min"));
                     ui.label(RichText::new("0 turns it off").weak());
                 });

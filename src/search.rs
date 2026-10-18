@@ -99,14 +99,18 @@ fn concat(parts: Vec<Option<Vec<u32>>>) -> Option<Vec<u32>> {
 }
 
 /// Ids whose name contains `needle`, found with one SIMD pass over the name arena per thread.
+/// A case-insensitive needle is already lowercase.
 fn candidates(ix: &Index, needle: &[u8], case: bool, cancelled: &(dyn Fn() -> bool + Sync)) -> Option<Vec<u32>> {
-    let hay = if case { ix.names_bytes() } else { ix.folded_bytes() };
+    let hay = ix.names_bytes();
     let n = hay.len();
-    if n == 0 {
+    if n == 0 || needle.is_empty() {
         return Some(Vec::new());
     }
     let chunk = (n / (rayon::current_num_threads() * 8)).max(1 << 20);
+    // Without letters, case doesn't matter and the plain substring search applies.
+    let exact = case || !needle.iter().any(u8::is_ascii_alphabetic);
     let finder = memchr::memmem::Finder::new(needle);
+    let (rare_at, rare) = rarest(needle);
     let parts: Vec<Option<Vec<u32>>> = (0..n.div_ceil(chunk))
         .into_par_iter()
         .map(|c| {
@@ -114,35 +118,68 @@ fn candidates(ix: &Index, needle: &[u8], case: bool, cancelled: &(dyn Fn() -> bo
                 return None;
             }
             let (start, end) = (c * chunk, ((c + 1) * chunk).min(n));
-            // Let matches that start in this chunk run past its end.
-            let window = &hay[start..(end + needle.len() - 1).min(n)];
-            let mut out = Vec::new();
-            let mut last = NONE;
-            let mut cur: Option<(u32, usize)> = None;
-            for pos in finder.find_iter(window) {
-                let off = start + pos;
-                if off >= end {
-                    break;
+            let mut hits = Hits { ix, len: needle.len(), out: Vec::new(), last: NONE, cur: None };
+            if exact {
+                // Let matches that start in this chunk run past its end.
+                let window = &hay[start..(end + needle.len() - 1).min(n)];
+                for pos in finder.find_iter(window) {
+                    hits.add(start + pos);
                 }
-                let (id, name_end) = match cur {
-                    Some((id, e)) if off < e => (id, e),
-                    _ => {
-                        let Some(id) = ix.id_at(off, 0) else { continue };
-                        let e = ix.name_end(id);
-                        cur = Some((id, e));
-                        (id, e)
+            } else {
+                // Find the needle's rarest byte in either case, then compare the rest around it.
+                let (lo, hi) = (rare, rare.to_ascii_uppercase());
+                let from = (start + rare_at).min(n);
+                let to = (end + rare_at).min(n);
+                for pos in memchr::memchr2_iter(lo, hi, &hay[from..to]) {
+                    let at = from + pos - rare_at;
+                    if at + needle.len() <= n && hay[at..at + needle.len()].eq_ignore_ascii_case(needle) {
+                        hits.add(at);
                     }
-                };
-                // Skip matches that run from one name into the next.
-                if id != last && off + needle.len() <= name_end {
-                    out.push(id);
-                    last = id;
                 }
             }
-            Some(out)
+            Some(hits.out)
         })
         .collect();
     concat(parts)
+}
+
+/// Turns arena offsets of matches, in increasing order, into ids.
+struct Hits<'a> {
+    ix: &'a Index,
+    len: usize,
+    out: Vec<u32>,
+    last: u32,
+    cur: Option<(u32, usize)>,
+}
+
+impl Hits<'_> {
+    fn add(&mut self, off: usize) {
+        let (id, name_end) = match self.cur {
+            Some((id, e)) if off < e => (id, e),
+            _ => {
+                let Some(id) = self.ix.id_at(off, 0) else { return };
+                let e = self.ix.name_end(id);
+                self.cur = Some((id, e));
+                (id, e)
+            }
+        };
+        // Skip matches that run from one name into the next.
+        if id != self.last && off + self.len <= name_end {
+            self.out.push(id);
+            self.last = id;
+        }
+    }
+}
+
+/// The position and value of the needle byte least likely to appear in file names, judged by
+/// rough letter frequencies. Scanning for it finds the fewest false starts.
+fn rarest(needle: &[u8]) -> (usize, u8) {
+    const COMMON: &[u8] = b" ._-0123456789eatoinsrlcdhpmugfbyvwkxjqz";
+    let score = |b: u8| match COMMON.iter().position(|&c| c == b) {
+        Some(i) => i,
+        None => COMMON.len() + 1,
+    };
+    needle.iter().copied().enumerate().max_by_key(|&(_, b)| score(b)).unwrap_or((0, needle[0]))
 }
 
 /// Sorts ids that are in name order; ties stay in name order.

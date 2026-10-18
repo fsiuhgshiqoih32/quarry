@@ -1,7 +1,7 @@
 //! Quarry: instant file search for Windows, macOS and Linux.
 //!
 //! The library holds everything but the window: the index ([`index`]), scanning ([`scan`]), the
-//! query language ([`query`]), searching ([`search`]), live updates ([`engine`]), persistence
+//! query language ([`query`]), searching ([`search`]), live updates ([`engine`], [`watch`]), persistence
 //! ([`store`]) and the HTTP API ([`serve`]).
 
 pub mod art;
@@ -15,3 +15,4 @@ pub mod scan;
 pub mod search;
 pub mod serve;
 pub mod store;
+pub mod watch;

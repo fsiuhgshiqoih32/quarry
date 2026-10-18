@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+Engine work merged from Scry, a sibling Everything clone.
+
+- Start-up brings the saved index up to date in place, folder by folder, instead of building a
+  second index: searchable throughout, about a third of the peak memory, and quitting part-way
+  keeps what was done. Periodic refreshes and lost-event recovery use the same walk.
+- Linux: live updates now cover every indexed folder (home folder first), not just the home
+  folder. If the inotify limit runs out, the status bar says so and the rest is refreshed hourly.
+  The hourly rescan is no longer on by default.
+- Windows: live updates use a 512 KiB ReadDirectoryChangesW buffer, and a drive is refreshed if
+  Windows still drops events.
+- Lower memory: the scan streams into the index, the saved index loads as a stream, and the
+  lowercased copy of every name is gone. For 5.4 million files: loading peaks at 331 MB instead of
+  842 MB, a full scan at 480 MB instead of about 1 GB, and start-up at 530 MB instead of 1.4 GB.
+
 ## 0.1.1
 
 - The window now opens on machines without OpenGL 2 (many virtual machines, remote desktops and

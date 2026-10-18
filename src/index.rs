@@ -63,9 +63,9 @@ pub struct Meta {
 #[derive(Default)]
 pub struct Index {
     entries: Vec<Entry>,
+    /// Every name, concatenated in id order. Case-insensitive searches fold as they compare
+    /// instead of keeping a lowercased copy, which would cost as much memory again as the names.
     names: String,
-    /// `names` with ASCII letters lowercased. Same byte offsets, so one name lookup serves both.
-    folded: Vec<u8>,
     roots: Vec<u32>,
     /// Live ids in name order. Searches walk this so results come out sorted by name.
     by_name: Vec<u32>,
@@ -137,11 +137,6 @@ impl Index {
         self.names.as_bytes()
     }
 
-    /// Like [`Index::names_bytes`], ASCII-lowercased.
-    pub fn folded_bytes(&self) -> &[u8] {
-        &self.folded
-    }
-
     /// The entry whose name contains the arena bytes `off..off + len`, if one does.
     pub fn id_at(&self, off: usize, len: usize) -> Option<u32> {
         let i = self.entries.partition_point(|e| e.name_off as usize <= off).checked_sub(1)?;
@@ -157,6 +152,7 @@ impl Index {
 
     fn rebuild_rank(&mut self) {
         self.rank.clear();
+        self.rank.reserve_exact(self.entries.len());
         self.rank.resize(self.entries.len(), NONE);
         for (pos, &id) in self.by_name.iter().enumerate() {
             self.rank[id as usize] = pos as u32;
@@ -167,12 +163,6 @@ impl Index {
         let e = &self.entries[id as usize];
         let start = e.name_off as usize;
         &self.names[start..start + e.name_len as usize]
-    }
-
-    pub fn folded_name(&self, id: u32) -> &[u8] {
-        let e = &self.entries[id as usize];
-        let start = e.name_off as usize;
-        &self.folded[start..start + e.name_len as usize]
     }
 
     /// Adds a root folder: a top-level entry whose name is its full path.
@@ -201,8 +191,15 @@ impl Index {
         let name = &name[..end];
         let id = u32::try_from(self.entries.len()).expect("index full");
         let name_off = u32::try_from(self.names.len()).expect("name arena full");
+        // Past a million entries, grow by an eighth instead of doubling: a refresh that adds a
+        // few files to a loaded index would otherwise double its memory.
+        if self.entries.len() == self.entries.capacity() && self.entries.len() >= 1 << 20 {
+            self.entries.reserve_exact(self.entries.len() / 8);
+        }
+        if self.names.len() + name.len() > self.names.capacity() && self.names.len() >= 1 << 24 {
+            self.names.reserve_exact(self.names.len() / 8 + name.len());
+        }
         self.names.push_str(name);
-        self.folded.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
         self.entries.push(Entry {
             name_off,
             name_len: name.len() as u16,
@@ -342,6 +339,58 @@ impl Index {
         self.revision += 1;
     }
 
+    /// Removes several children of one folder and everything below them. One pass over the
+    /// folder's child list instead of one per entry, which matters for folders with many files.
+    pub fn remove_many(&mut self, parent: u32, ids: &[u32]) {
+        let mut freed = 0u64;
+        let mut any = false;
+        for &id in ids {
+            let e = self.entries[id as usize];
+            if e.is_deleted() || e.parent != parent {
+                continue;
+            }
+            freed += e.size;
+            any = true;
+            let mut stack = vec![id];
+            while let Some(cur) = stack.pop() {
+                let ent = &mut self.entries[cur as usize];
+                if ent.flags & DELETED == 0 {
+                    ent.flags |= DELETED;
+                    self.deleted += 1;
+                }
+                let mut c = ent.first_child;
+                while c != NONE {
+                    stack.push(c);
+                    c = self.entries[c as usize].next_sibling;
+                }
+            }
+        }
+        if !any {
+            return;
+        }
+        // Relink the survivors.
+        let (mut first, mut last) = (NONE, NONE);
+        let mut c = self.entries[parent as usize].first_child;
+        while c != NONE {
+            let next = self.entries[c as usize].next_sibling;
+            if !self.entries[c as usize].is_deleted() {
+                if last == NONE {
+                    first = c;
+                } else {
+                    self.entries[last as usize].next_sibling = c;
+                }
+                last = c;
+            }
+            c = next;
+        }
+        if last != NONE {
+            self.entries[last as usize].next_sibling = NONE;
+        }
+        self.entries[parent as usize].first_child = first;
+        self.add_size(parent, -(freed as i64));
+        self.revision += 1;
+    }
+
     fn unlink(&mut self, parent: u32, id: u32) {
         let next = self.entries[id as usize].next_sibling;
         if self.entries[parent as usize].first_child == id {
@@ -446,51 +495,70 @@ impl Index {
     }
 
     fn cmp_names(&self, a: u32, b: u32) -> Ordering {
-        self.folded_name(a).cmp(self.folded_name(b)).then_with(|| self.name(a).cmp(self.name(b))).then(a.cmp(&b))
+        let (x, y) = (self.name(a).as_bytes(), self.name(b).as_bytes());
+        cmp_folded(x, y).then_with(|| x.cmp(y)).then(a.cmp(&b))
     }
 
     /// Raw parts for saving. `parent` ids are remapped by the caller.
     pub(crate) fn raw_parts(&self) -> (&[Entry], &[u32]) {
         (&self.entries, &self.by_name)
     }
+}
 
-    /// Rebuilds an index from saved parts: entries in id order with their parents, the names
-    /// concatenated in the same order, and the saved name order.
-    pub(crate) fn from_parts(
-        records: Vec<(u16, u16, u32, u64, i64)>,
-        names: String,
-        by_name: Vec<u32>,
-    ) -> Result<Index, String> {
-        let n = records.len();
-        let mut ix = Index {
-            entries: Vec::with_capacity(n),
-            folded: names.as_bytes().to_ascii_lowercase(),
-            names,
-            ..Default::default()
-        };
-        let mut off: usize = 0;
-        for (i, &(len, flags, parent, size, mtime)) in records.iter().enumerate() {
-            let end = off + len as usize;
-            if end > ix.names.len() || !ix.names.is_char_boundary(off) || !ix.names.is_char_boundary(end) {
+/// Compares two names with ASCII letters folded to lowercase.
+pub fn cmp_folded(x: &[u8], y: &[u8]) -> Ordering {
+    for (a, b) in x.iter().zip(y) {
+        let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+        if a != b {
+            return a.cmp(&b);
+        }
+    }
+    x.len().cmp(&y.len())
+}
+
+/// Rebuilds a saved index one record at a time, so loading needs no second copy of the data.
+pub(crate) struct Loader {
+    entries: Vec<Entry>,
+    names_len: usize,
+}
+
+impl Loader {
+    pub(crate) fn with_capacity(count: usize) -> Loader {
+        Loader { entries: Vec::with_capacity(count), names_len: 0 }
+    }
+
+    /// Adds the next record: name length, flags, parent id, size and modification time.
+    pub(crate) fn push(&mut self, len: u16, flags: u16, parent: u32, size: u64, mtime: i64) -> Result<(), String> {
+        let i = self.entries.len();
+        if parent != NONE && parent as usize >= i {
+            return Err("corrupt parent link".into());
+        }
+        self.entries.push(Entry {
+            name_off: u32::try_from(self.names_len).map_err(|_| "name table too large")?,
+            name_len: len,
+            flags: flags & !DELETED,
+            parent,
+            first_child: NONE,
+            next_sibling: NONE,
+            size,
+            mtime: pack_time(mtime),
+        });
+        self.names_len += len as usize;
+        Ok(())
+    }
+
+    /// Finishes with the concatenated names and the saved name order.
+    pub(crate) fn finish(self, names: String, by_name: Vec<u32>) -> Result<Index, String> {
+        let n = self.entries.len();
+        if self.names_len != names.len() {
+            return Err("corrupt name table".into());
+        }
+        let mut ix = Index { entries: self.entries, names, ..Default::default() };
+        for e in &ix.entries {
+            let (a, b) = (e.name_off as usize, e.name_off as usize + e.name_len as usize);
+            if !ix.names.is_char_boundary(a) || !ix.names.is_char_boundary(b) {
                 return Err("corrupt name table".into());
             }
-            if parent != NONE && parent as usize >= i {
-                return Err("corrupt parent link".into());
-            }
-            ix.entries.push(Entry {
-                name_off: off as u32,
-                name_len: len,
-                flags: flags & !DELETED,
-                parent,
-                first_child: NONE,
-                next_sibling: NONE,
-                size,
-                mtime: pack_time(mtime),
-            });
-            off = end;
-        }
-        if off != ix.names.len() {
-            return Err("corrupt name table".into());
         }
         for i in (0..n).rev() {
             let p = ix.entries[i].parent;

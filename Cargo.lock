@@ -3562,6 +3562,8 @@ dependencies = [
  "egui_extras",
  "global-hotkey",
  "gtk",
+ "inotify",
+ "libc",
  "memchr",
  "notify",
  "objc2 0.6.5",
