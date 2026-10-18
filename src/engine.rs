@@ -1,7 +1,8 @@
 //! Owns the index: loads it, scans, follows file system events, and saves it.
 //!
 //! One thread does all writing. Searches only take the read lock, so typing stays responsive while
-//! a rescan runs (the old index keeps serving until the new one is swapped in).
+//! the index changes. At start-up a saved index is searchable at once and is then brought up to
+//! date in place, folder by folder; a full rescan builds a new index and swaps it in.
 
 use std::collections::HashSet;
 use std::fs;
@@ -12,12 +13,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::{Mutex, RwLock};
 
 use crate::config::{self, Config};
-use crate::index::{DIR, Index, Meta};
-use crate::scan::{self, Excludes, Node, Progress};
+use crate::index::{DIR, Index, Meta, SYMLINK};
+use crate::scan::{self, Excludes, Node, OnDir, Progress};
+use crate::watch::{self, Change, Watcher};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Watching {
@@ -113,12 +114,21 @@ struct Worker {
     cfg: Config,
     index_path: PathBuf,
     excludes: Excludes,
-    watcher: Option<RecommendedWatcher>,
-    events_tx: Sender<notify::Result<notify::Event>>,
-    events_rx: Receiver<notify::Result<notify::Event>>,
+    watcher: Option<Watcher>,
+    events_tx: Sender<Change>,
+    events_rx: Receiver<Change>,
     dirty: bool,
     last_save: Instant,
     last_scan: Instant,
+}
+
+/// What a burst of file system events asks for beyond patching the changed paths.
+enum Resync {
+    Nothing,
+    /// Events were lost below these folders.
+    Folders(Vec<PathBuf>),
+    /// Events were lost everywhere.
+    Everything,
 }
 
 impl Worker {
@@ -141,7 +151,7 @@ impl Worker {
 
     fn run(mut self, rx: Receiver<Cmd>) {
         let loaded = crate::store::load(&self.index_path, self.cfg.fingerprint());
-        let mut need_scan = loaded.is_none() || self.cfg.rescan_on_start;
+        let have_index = loaded.is_some();
         if let Some(mut ix) = loaded {
             ix.epoch = 1;
             *self.shared.index.write() = ix;
@@ -149,10 +159,19 @@ impl Worker {
             self.shared.changed();
         }
         self.restart_watcher();
+        let mut need_scan = !have_index;
+        let mut need_refresh = have_index && self.cfg.rescan_on_start;
         loop {
             if need_scan {
                 need_scan = false;
+                need_refresh = false;
                 if !self.full_scan() {
+                    break;
+                }
+            }
+            if need_refresh {
+                need_refresh = false;
+                if !self.refresh(None) {
                     break;
                 }
             }
@@ -164,23 +183,46 @@ impl Worker {
                 },
                 recv(self.events_rx) -> ev => {
                     if let Ok(ev) = ev {
-                        need_scan |= self.handle_events(ev);
+                        match self.handle_events(ev) {
+                            Resync::Nothing => {}
+                            Resync::Everything => need_refresh = true,
+                            Resync::Folders(dirs) => {
+                                for d in dirs {
+                                    if !self.refresh(Some(d)) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 },
                 default(Duration::from_secs(20)) => {
                     if self.dirty && self.last_save.elapsed() > Duration::from_secs(600) {
                         self.save();
                     }
-                    let every = self.cfg.rescan_minutes as u64 * 60;
+                    let every = self.refresh_minutes() as u64 * 60;
                     if every > 0 && self.last_scan.elapsed() > Duration::from_secs(every) {
-                        need_scan = true;
+                        need_refresh = true;
                     }
                 },
+            }
+            if self.shared.progress.cancelled() {
+                break;
             }
         }
         if self.dirty {
             self.save();
         }
+    }
+
+    /// Minutes between periodic refreshes. Folders the watcher cannot cover (the inotify limit
+    /// on Linux, for instance) get an hourly refresh even when the setting is off.
+    fn refresh_minutes(&self) -> u32 {
+        if self.cfg.rescan_minutes > 0 {
+            return self.cfg.rescan_minutes;
+        }
+        let watching = self.shared.status.lock().watching.clone();
+        if self.cfg.live_updates && matches!(watching, Watching::Partly(_) | Watching::Failed(_)) { 60 } else { 0 }
     }
 
     /// Returns true if the new settings need a rescan.
@@ -197,36 +239,77 @@ impl Worker {
 
     fn restart_watcher(&mut self) {
         self.watcher = None;
-        let state = if self.cfg.live_updates {
-            let tx = self.events_tx.clone();
-            match notify::recommended_watcher(move |res| {
-                let _ = tx.send(res);
-            }) {
-                Ok(mut w) => {
-                    let mut failed = Vec::new();
-                    let roots = config::watch_roots(&scan::dedup_roots(&self.cfg.effective_roots()));
-                    for r in &roots {
-                        if let Err(e) = w.watch(r, RecursiveMode::Recursive) {
-                            failed.push(format!("{}: {e}", r.display()));
-                        }
-                    }
-                    let state = if failed.is_empty() {
-                        Watching::On
-                    } else if failed.len() == roots.len() {
-                        Watching::Failed(failed.join("; "))
-                    } else {
-                        Watching::Partly(failed.join("; "))
-                    };
-                    self.watcher = Some(w);
-                    state
-                }
-                Err(e) => Watching::Failed(e.to_string()),
+        if self.cfg.live_updates {
+            let w = Watcher::new(self.events_tx.clone());
+            for r in &scan::dedup_roots(&self.cfg.effective_roots()) {
+                w.watch_root(r);
             }
-        } else {
-            Watching::Off
+            self.watcher = Some(w);
+            self.watch_indexed_folders();
+        }
+        self.publish_watch_state();
+    }
+
+    /// Mirrors the watcher's state into the status, if it changed.
+    fn publish_watch_state(&self) {
+        let state = match &self.watcher {
+            None => Watching::Off,
+            Some(w) => match w.state() {
+                watch::State::On => Watching::On,
+                watch::State::Partly(why) => Watching::Partly(why),
+                watch::State::Failed(why) => Watching::Failed(why),
+            },
         };
-        self.shared.status.lock().watching = state;
-        self.shared.changed();
+        let mut st = self.shared.status.lock();
+        if st.watching != state {
+            st.watching = state;
+            drop(st);
+            self.shared.changed();
+        }
+    }
+
+    /// Linux: gives every indexed folder an inotify watch, the home folder first so it stays live
+    /// if the kernel's limit runs out. Folders that already have one are unaffected.
+    fn watch_indexed_folders(&self) {
+        let Some(w) = &self.watcher else { return };
+        if !w.wants_dirs() {
+            return;
+        }
+        let ix = self.shared.index.read();
+        let home = dirs::home_dir();
+        let mut path = String::new();
+        let mut later = Vec::new();
+        for id in 0..ix.len() as u32 {
+            let e = ix.entry(id);
+            if !e.is_dir() || e.is_deleted() || e.flags & SYMLINK != 0 {
+                continue;
+            }
+            ix.path_into(id, &mut path);
+            if home.as_deref().is_some_and(|h| Path::new(&path).starts_with(h)) {
+                w.watch_dir(Path::new(&path));
+            } else {
+                later.push(id);
+            }
+        }
+        for id in later {
+            ix.path_into(id, &mut path);
+            w.watch_dir(Path::new(&path));
+        }
+        drop(ix);
+        self.publish_watch_state();
+    }
+
+    /// During scans only folders in the home folder get their watch at once; the rest follow
+    /// when the scan is done, in [`Worker::watch_indexed_folders`].
+    fn on_dir(&self) -> impl Fn(&Path) + Sync + '_ {
+        let home = dirs::home_dir();
+        move |dir: &Path| {
+            if let Some(w) = &self.watcher
+                && home.as_deref().is_some_and(|h| dir.starts_with(h))
+            {
+                w.watch_dir(dir);
+            }
+        }
     }
 
     /// Returns false if the scan was cancelled for shutdown.
@@ -238,7 +321,7 @@ impl Worker {
         self.shared.changed();
         let start = Instant::now();
         let roots = self.cfg.effective_roots();
-        let mut ix = scan::scan(&roots, &self.excludes, p);
+        let mut ix = scan::scan_with(&roots, &self.excludes, p, &self.on_dir());
         if p.cancelled() {
             return false;
         }
@@ -254,8 +337,57 @@ impl Worker {
             st.last_scan = Some((SystemTime::now(), start.elapsed(), p.unreadable.load(Ordering::Relaxed)));
         }
         self.shared.changed();
+        self.watch_indexed_folders();
         self.save();
         true
+    }
+
+    /// Brings the index up to date in place: below one folder, or everywhere with `None`. The
+    /// index stays searchable and keeps what was done if Quarry quits part-way. Returns false if
+    /// cancelled for shutdown.
+    fn refresh(&mut self, below: Option<PathBuf>) -> bool {
+        let start: Vec<scan::Job> = {
+            let ix = self.shared.index.read();
+            match &below {
+                None => ix.roots().iter().map(|&r| (r, PathBuf::from(ix.name(r)))).collect(),
+                Some(p) => match ix.lookup(p) {
+                    Some(id) if ix.entry(id).is_dir() => vec![(id, p.clone())],
+                    _ => {
+                        drop(ix);
+                        apply(&self.shared, &self.excludes, vec![p.clone()], &self.on_dir());
+                        self.dirty = true;
+                        return true;
+                    }
+                },
+            }
+        };
+        let everything = below.is_none();
+        let shared = self.shared.clone();
+        let p = &shared.progress;
+        if everything {
+            p.items.store(0, Ordering::Relaxed);
+            p.unreadable.store(0, Ordering::Relaxed);
+            self.shared.status.lock().scanning = true;
+            self.shared.changed();
+        }
+        let started = Instant::now();
+        let done = scan::refresh(&shared.index, start, &self.excludes, p, &self.on_dir(), &|| shared.changed());
+        self.dirty = true;
+        if everything {
+            let mut st = self.shared.status.lock();
+            st.scanning = false;
+            if done {
+                st.last_scan = Some((SystemTime::now(), started.elapsed(), p.unreadable.load(Ordering::Relaxed)));
+            }
+            drop(st);
+            self.shared.changed();
+            if done {
+                self.last_scan = Instant::now();
+                self.watch_indexed_folders();
+                self.save();
+            }
+        }
+        !p.cancelled()
     }
 
     fn save(&mut self) {
@@ -271,16 +403,23 @@ impl Worker {
         }
     }
 
-    /// Collects a burst of events, then applies them in one go. Returns true if the watcher lost
-    /// track and a rescan is needed.
-    fn handle_events(&mut self, first: notify::Result<notify::Event>) -> bool {
+    /// Collects a burst of events, then applies them in one go.
+    fn handle_events(&mut self, first: Change) -> Resync {
         let mut paths: HashSet<PathBuf> = HashSet::new();
-        let mut rescan = false;
-        self.take_event(first, &mut paths, &mut rescan);
+        let mut lost: Vec<PathBuf> = Vec::new();
+        let mut lost_all = false;
+        let mut take = |c: Change, paths: &mut HashSet<PathBuf>| match c {
+            Change::Path(p) => {
+                paths.insert(p);
+            }
+            Change::Rescan(Some(p)) => lost.push(p),
+            Change::Rescan(None) => lost_all = true,
+        };
+        take(first, &mut paths);
         let deadline = Instant::now() + Duration::from_millis(250);
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match self.events_rx.recv_timeout(left) {
-                Ok(ev) => self.take_event(ev, &mut paths, &mut rescan),
+                Ok(ev) => take(ev, &mut paths),
                 Err(_) => break,
             }
             if paths.len() > 200_000 {
@@ -292,35 +431,25 @@ impl Worker {
         if cfg!(target_os = "macos") {
             // FSEvents can report the data volume's own path for files that live at /Users/...
             paths = paths.into_iter().map(firmlinked).collect();
+            lost = lost.into_iter().map(firmlinked).collect();
         }
         if !paths.is_empty() {
             let mut list: Vec<PathBuf> = paths.into_iter().collect();
             list.sort_by_key(|p| p.components().count());
-            apply(&self.shared, &self.excludes, list);
+            apply(&self.shared, &self.excludes, list, &self.on_dir());
             self.dirty = true;
             self.shared.changed();
         }
-        rescan
-    }
-}
-
-impl Worker {
-    fn take_event(&self, ev: notify::Result<notify::Event>, paths: &mut HashSet<PathBuf>, rescan: &mut bool) {
-        match ev {
-            Ok(ev) => {
-                if ev.need_rescan() {
-                    *rescan = true;
-                }
-                if !matches!(ev.kind, EventKind::Access(_)) {
-                    paths.extend(ev.paths);
-                }
-            }
-            Err(e) => {
-                if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) {
-                    self.shared.status.lock().watching =
-                        Watching::Partly("the system limit on watched folders was reached".into());
-                }
-            }
+        // New folders may have used up the last inotify watches.
+        self.publish_watch_state();
+        if lost_all {
+            Resync::Everything
+        } else if lost.is_empty() {
+            Resync::Nothing
+        } else {
+            lost.sort();
+            lost.dedup();
+            Resync::Folders(lost)
         }
     }
 }
@@ -346,7 +475,7 @@ enum Op {
 
 /// Brings the index in line with the current state of `paths` on disk. File system work happens
 /// under the read lock (searches keep running); the write lock is held only to apply the result.
-pub fn apply(shared: &Shared, ex: &Excludes, paths: Vec<PathBuf>) {
+pub fn apply(shared: &Shared, ex: &Excludes, paths: Vec<PathBuf>, on_dir: OnDir) {
     let quiet = Progress::default();
     let mut ops = Vec::new();
     {
@@ -369,7 +498,7 @@ pub fn apply(shared: &Shared, ex: &Excludes, paths: Vec<PathBuf>) {
                 Ok(md) => {
                     let meta = scan::meta_from(&md, &name);
                     let is_dir = meta.flags & DIR != 0;
-                    let kids = |p: &Path| if is_dir { scan::scan_dir(p, ex, &quiet, &|_| {}) } else { Vec::new() };
+                    let kids = |p: &Path| if is_dir { scan::scan_dir(p, ex, &quiet, on_dir) } else { Vec::new() };
                     match existing {
                         Some(id) if ix.entry(id).is_dir() == is_dir && ix.name(id) == name => {
                             ops.push(Op::Update(id, meta))
@@ -456,7 +585,7 @@ mod tests {
         fs::create_dir_all(dir.join("a/new/deep")).unwrap();
         fs::write(dir.join("a/new/deep/f.bin"), b"123456").unwrap();
         fs::remove_file(dir.join("a/old.txt")).unwrap();
-        apply(&shared, &ex, vec![dir.join("a/new"), dir.join("a/new/deep/f.bin"), dir.join("a/old.txt")]);
+        apply(&shared, &ex, vec![dir.join("a/new"), dir.join("a/new/deep/f.bin"), dir.join("a/old.txt")], &|_| {});
         let ix = shared.index.read();
         assert!(ix.lookup(&dir.join("a").join("old.txt")).is_none());
         let f = ix.lookup(&dir.join("a").join("new").join("deep").join("f.bin")).unwrap();

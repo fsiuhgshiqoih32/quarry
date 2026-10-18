@@ -247,7 +247,7 @@ fn self_test_in(root: &Path) -> Result<(), String> {
     let changes = Arc::new(AtomicU64::new(0));
     let c = changes.clone();
     let state_dir = std::env::temp_dir().join(format!("quarry-self-test-state-{}", std::process::id()));
-    let mut engine = Engine::start(cfg, state_dir.join("index.bin"), move || {
+    let mut engine = Engine::start(cfg.clone(), state_dir.join("index.bin"), move || {
         c.fetch_add(1, Ordering::Relaxed);
     });
     let shared = engine.shared.clone();
@@ -274,6 +274,18 @@ fn self_test_in(root: &Path) -> Result<(), String> {
     let refused = http_get_host(api.port, "/status", "evil.example")?;
     check(refused.contains("loopback"), "HTTP API refuses foreign Host headers")?;
     drop(api);
+    engine.shutdown();
+
+    // Changes made while Quarry is closed show up once it starts again from the saved index.
+    w("docs/while-closed.txt", b"x")?;
+    std::fs::remove_file(root.join("docs/renamed.log")).map_err(|e| e.to_string())?;
+    let mut engine = Engine::start(cfg, state_dir.join("index.bin"), || {});
+    let shared = engine.shared.clone();
+    wait_for("start-up catches up with changes made while closed", Duration::from_secs(30), || {
+        let ix = shared.index.read();
+        find(&ix, "while-closed") == ["while-closed.txt"] && find(&ix, "renamed").is_empty()
+    })?;
+    check(shared.status.lock().loaded_from_disk, "start-up reuses the saved index")?;
     engine.shutdown();
     let _ = std::fs::remove_dir_all(&state_dir);
     Ok(())

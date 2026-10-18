@@ -27,7 +27,6 @@ eframe = { version = "0.33.3", features = ["persistence", "wgpu"] }
 egui_extras = "0.33.3"
 global-hotkey = "0.9"
 memchr = "2.8"
-notify = "8"
 opener = { version = "0.8", features = ["reveal"] }
 parking_lot = "0.12"
 raw-window-handle = "0.6"
@@ -45,17 +44,22 @@ drag = "2.1"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+notify = "8"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
+inotify = { version = "0.11", default-features = false }
+libc = "0.2"
 
 [build-dependencies]
 winresource = "0.1"

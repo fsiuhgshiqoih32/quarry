@@ -26,9 +26,11 @@ pub struct Config {
     pub show_hidden: bool,
     /// Follow file system events so the index stays current.
     pub live_updates: bool,
-    /// Rescan once at start-up to pick up changes made while Quarry wasn't running.
+    /// Bring the saved index up to date at start-up, to pick up changes made while Quarry
+    /// wasn't running. The index is searchable meanwhile.
     pub rescan_on_start: bool,
-    /// Full rescan every this many minutes; 0 turns it off.
+    /// Refresh the index every this many minutes; 0 turns it off. Folders that live updates can't
+    /// cover (the inotify limit on Linux) are refreshed hourly regardless.
     pub rescan_minutes: u32,
     /// Global shortcut that shows the window, e.g. "Alt+Shift+Space". Empty turns it off.
     pub hotkey: String,
@@ -54,9 +56,7 @@ impl Default for Config {
             show_hidden: true,
             live_updates: true,
             rescan_on_start: true,
-            // Linux watches only the home folder (inotify needs one watch per folder), so the rest of
-            // the system is refreshed by rescanning.
-            rescan_minutes: if cfg!(target_os = "linux") { 60 } else { 0 },
+            rescan_minutes: 0,
             hotkey: "Alt+Shift+Space".into(),
             close_to_tray: cfg!(feature = "tray"),
             http_enabled: false,
@@ -274,28 +274,6 @@ fn unescape_mount(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-/// The folders live updates watch. Linux's inotify needs a watch per folder, so a whole-system root
-/// is narrowed to the home folder there; periodic rescans cover the rest.
-pub fn watch_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
-    if cfg!(target_os = "linux") {
-        let home = dirs::home_dir();
-        let mut out = Vec::new();
-        for r in roots {
-            if r == Path::new("/") {
-                if let Some(h) = &home {
-                    out.push(h.clone());
-                }
-            } else {
-                out.push(r.clone());
-            }
-        }
-        out.dedup();
-        out
-    } else {
-        roots.to_vec()
-    }
 }
 
 #[cfg(test)]

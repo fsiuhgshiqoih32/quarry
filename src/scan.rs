@@ -2,13 +2,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use parking_lot::RwLock;
 use rayon::prelude::*;
 
-use crate::index::{CASE_INSENSITIVE_FS, DIR, HIDDEN, Index, Meta, SYMLINK};
+use crate::index::{CASE_INSENSITIVE_FS, DIR, HIDDEN, Index, Meta, NONE, SYMLINK};
 
 /// Counters a running scan updates, and a flag to stop it early.
 #[derive(Default)]
@@ -334,38 +334,30 @@ pub fn scan(roots: &[PathBuf], ex: &Excludes, progress: &Progress) -> Index {
     scan_with(roots, ex, progress, &|_| {})
 }
 
-/// How many folders to list at once. Listing is mostly waiting on the file system, so a few more
-/// threads than cores keeps the disk busy.
-fn lister_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(4, 16)
-}
-
-/// Scans every root. Listing threads hand each folder to one thread that appends it to the index
-/// straight away, so no copy of the tree is held in between. Folders are added before their
-/// contents, which keeps every parent id smaller than its children's.
+/// Scans every root and returns the finished index.
+///
+/// Listing threads recurse into the folders they find straight away, as a rayon tree walk, and
+/// stream each listing to one thread that appends it to the index, so no copy of the tree is held
+/// in between. Folders get a provisional number when found; the appending thread maps it to the
+/// folder's id. A listing is sent before its subfolders are listed, so a folder is always appended
+/// before its contents and every parent id stays smaller than its children's.
 pub fn scan_with(roots: &[PathBuf], ex: &Excludes, progress: &Progress, on_dir: OnDir) -> Index {
     let mut ix = Index::new();
+    let mut ids: Vec<u32> = Vec::new();
     let mut start = Vec::new();
     for r in dedup_roots(roots) {
         let Ok(md) = fs::metadata(&r) else { continue };
         if !md.is_dir() {
             continue;
         }
-        let id = ix.add_root(&root_name(&r), Meta { flags: DIR, size: 0, mtime: secs(md.modified()) });
-        start.push((id, r));
+        ids.push(ix.add_root(&root_name(&r), Meta { flags: DIR, size: 0, mtime: secs(md.modified()) }));
+        start.push(r);
     }
-    walk(start, progress, on_dir, |dir, path, listing, next, _| {
-        for (name, meta) in listing {
-            if meta.flags & DIR != 0 {
-                let p = path.join(&name);
-                if ex.skip_dir(&p, &name) {
-                    continue;
-                }
-                let id = ix.add(dir, &name, meta);
-                next.push((id, p));
-            } else {
-                ix.add(dir, &name, meta);
-            }
+    walk(start, ex, progress, on_dir, |parent, listing| {
+        let Some(&dir) = ids.get(parent).filter(|&&d| d != NONE) else { return };
+        for (name, meta, token) in listing {
+            let id = ix.add(dir, &name, meta);
+            remember(&mut ids, token, id);
         }
         progress.items.store(ix.live_count() as u64, Ordering::Relaxed);
     });
@@ -373,67 +365,95 @@ pub fn scan_with(roots: &[PathBuf], ex: &Excludes, progress: &Progress, on_dir: 
     ix
 }
 
-/// A folder to list: its id in the index and its path.
-pub type Job = (u32, PathBuf);
+/// A listed folder's entries: name, metadata, and for subfolders their provisional number.
+type Listing = Vec<(String, Meta, usize)>;
 
-/// Lists folders on a pool of threads and hands each listing, in arrival order, to `apply` on
-/// the calling thread, which queues the subfolders to list next. `apply` also gets the number of
-/// folders still being listed. Stops early if cancelled.
+/// The provisional number of a file (only folders get one).
+const NO_TOKEN: usize = usize::MAX;
+
+fn remember(ids: &mut Vec<u32>, token: usize, id: u32) {
+    if token == NO_TOKEN {
+        return;
+    }
+    if ids.len() <= token {
+        ids.resize(token + 1, NONE);
+    }
+    ids[token] = id;
+}
+
+/// Lists every folder below `start` on rayon's threads and hands each listing to `apply`, which
+/// runs on one thread of its own with the provisional number of the listed folder. The starting
+/// folders are numbered 0, 1, ... in order. Excluded folders are left out of listings.
 fn walk(
-    start: Vec<Job>,
+    start: Vec<PathBuf>,
+    ex: &Excludes,
     progress: &Progress,
     on_dir: OnDir,
-    mut apply: impl FnMut(u32, &Path, Vec<(String, Meta)>, &mut Vec<Job>, usize),
+    mut apply: impl FnMut(usize, Listing) + Send,
 ) {
-    let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
-    let (res_tx, res_rx) = crossbeam_channel::unbounded::<(u32, PathBuf, Option<Vec<(String, Meta)>>)>();
+    let next = AtomicUsize::new(start.len());
+    let (tx, rx) = crossbeam_channel::unbounded::<(usize, Listing)>();
     std::thread::scope(|s| {
-        for _ in 0..lister_threads() {
-            let (job_rx, res_tx) = (job_rx.clone(), res_tx.clone());
-            s.spawn(move || {
-                for (dir, path) in job_rx {
-                    let listing = if progress.cancelled() { None } else { list(&path) };
-                    if listing.is_some() {
-                        on_dir(&path);
-                    }
-                    if res_tx.send((dir, path, listing)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(res_tx);
-        let mut pending = 0usize;
-        for job in start {
-            if job_tx.send(job).is_ok() {
-                pending += 1;
-            }
-        }
-        let mut next = Vec::new();
-        while pending > 0 {
-            let Ok((dir, path, listing)) = res_rx.recv() else { break };
-            pending -= 1;
-            if progress.cancelled() {
-                continue;
-            }
-            let Some(listing) = listing else {
-                progress.unreadable.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            apply(dir, &path, listing, &mut next, pending);
-            for job in next.drain(..) {
-                if job_tx.send(job).is_ok() {
-                    pending += 1;
+        s.spawn(move || {
+            for (parent, listing) in rx {
+                if !progress.cancelled() {
+                    apply(parent, listing);
                 }
             }
-        }
-        drop(job_tx);
+        });
+        start
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(token, path)| list_tree(&path, token, ex, progress, on_dir, &next, &tx));
+        drop(tx);
     });
 }
 
+fn list_tree(
+    path: &Path,
+    token: usize,
+    ex: &Excludes,
+    progress: &Progress,
+    on_dir: OnDir,
+    next: &AtomicUsize,
+    tx: &crossbeam_channel::Sender<(usize, Listing)>,
+) {
+    if progress.cancelled() {
+        return;
+    }
+    let Some(listing) = list(path) else {
+        progress.unreadable.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    on_dir(path);
+    let mut entries = Vec::with_capacity(listing.len());
+    let mut subdirs = Vec::new();
+    for (name, meta) in listing {
+        if meta.flags & DIR != 0 {
+            let p = path.join(&name);
+            if ex.skip_dir(&p, &name) {
+                continue;
+            }
+            let t = next.fetch_add(1, Ordering::Relaxed);
+            subdirs.push((p, t));
+            entries.push((name, meta, t));
+        } else {
+            entries.push((name, meta, NO_TOKEN));
+        }
+    }
+    // Sent before the subfolders are listed, so it reaches the index first.
+    if tx.send((token, entries)).is_err() {
+        return;
+    }
+    subdirs.into_par_iter().for_each(|(p, t)| list_tree(&p, t, ex, progress, on_dir, next, tx));
+}
+
+/// A folder to refresh: its id in the index and its path.
+pub type Job = (u32, PathBuf);
+
 /// Brings part of an existing index up to date in place: lists every folder below `start` and
 /// patches the index where it differs, keeping it searchable throughout. Work done before a
-/// cancel is kept. `tick` runs every second or so with the lock released. Returns false if
+/// cancel is kept. `tick` runs about once a second with the lock released. Returns false if
 /// cancelled.
 pub fn refresh(
     lock: &RwLock<Index>,
@@ -441,88 +461,86 @@ pub fn refresh(
     ex: &Excludes,
     progress: &Progress,
     on_dir: OnDir,
-    tick: &dyn Fn(),
+    tick: &(dyn Fn() + Sync),
 ) -> bool {
-    // Several listings are applied per write lock, so searches wait less often.
-    let mut batch: Vec<(u32, PathBuf, Vec<(String, Meta)>)> = Vec::new();
+    let mut ids: Vec<u32> = start.iter().map(|j| j.0).collect();
+    let paths: Vec<PathBuf> = start.into_iter().map(|j| j.1).collect();
     let mut last_tick = std::time::Instant::now();
-    let mut flush = |batch: &mut Vec<(u32, PathBuf, Vec<(String, Meta)>)>, next: &mut Vec<Job>, force: bool| {
-        if batch.is_empty() || (!force && batch.len() < 64) {
-            return;
-        }
+    let mut last_merge = std::time::Instant::now();
+    walk(paths, ex, progress, on_dir, |parent, listing| {
+        progress.items.fetch_add(listing.len() as u64, Ordering::Relaxed);
+        let Some(&dir) = ids.get(parent).filter(|&&d| d != NONE) else { return };
         let mut ix = lock.write();
-        for (dir, path, listing) in batch.drain(..) {
-            if (dir as usize) < ix.len() && !ix.entry(dir).is_deleted() {
-                patch_folder(&mut ix, ex, dir, &path, listing, next);
-            }
+        if (dir as usize) < ix.len() && !ix.entry(dir).is_deleted() {
+            patch_folder(&mut ix, dir, listing, &mut ids);
         }
-        if last_tick.elapsed() >= std::time::Duration::from_secs(1) {
+        // Merging new names into the name order touches the whole index, so not too often.
+        if last_merge.elapsed() >= std::time::Duration::from_secs(5) {
             ix.merge_pending();
-            drop(ix);
+            last_merge = std::time::Instant::now();
+        }
+        drop(ix);
+        if last_tick.elapsed() >= std::time::Duration::from_secs(1) {
             tick();
             last_tick = std::time::Instant::now();
         }
-    };
-    // Subfolders of a held listing are only queued once it is applied, so apply at once whenever
-    // the listing threads are about to run out of work.
-    let low = lister_threads() * 2;
-    walk(start, progress, on_dir, |dir, path, listing, next, in_flight| {
-        progress.items.fetch_add(listing.len() as u64, Ordering::Relaxed);
-        batch.push((dir, path.to_path_buf(), listing));
-        flush(&mut batch, next, in_flight < low);
     });
-    let mut ix = lock.write();
-    for (dir, path, listing) in batch.drain(..) {
-        if (dir as usize) < ix.len() && !ix.entry(dir).is_deleted() {
-            patch_folder(&mut ix, ex, dir, &path, listing, &mut Vec::new());
-        }
-    }
-    ix.merge_pending();
-    drop(ix);
+    lock.write().merge_pending();
     tick();
     !progress.cancelled()
 }
 
-/// Makes one folder's children in the index match a fresh listing, and queues its subfolders.
-fn patch_folder(
-    ix: &mut Index,
-    ex: &Excludes,
-    dir: u32,
-    path: &Path,
-    listing: Vec<(String, Meta)>,
-    next: &mut Vec<Job>,
-) {
-    let mut existing: std::collections::HashMap<String, u32> =
-        ix.children(dir).map(|c| (ix.name(c).to_string(), c)).collect();
-    for (name, meta) in listing {
-        let is_dir = meta.flags & DIR != 0;
-        let child = if is_dir { Some(path.join(&name)) } else { None };
-        if let Some(c) = &child
-            && ex.skip_dir(c, &name)
-        {
-            continue; // left in `existing`, so removed below if it was indexed
+/// Makes one folder's children in the index match a fresh listing, and records the ids of its
+/// subfolders. Both sides are sorted by name and walked together, which needs no copies of the
+/// names.
+fn patch_folder(ix: &mut Index, dir: u32, mut listing: Listing, ids: &mut Vec<u32>) {
+    enum Step {
+        Keep(u32, Meta, usize),
+        Replace(u32, String, Meta, usize),
+        Add(String, Meta, usize),
+    }
+    let mut existing: Vec<u32> = ix.children(dir).collect();
+    existing.sort_unstable_by(|&a, &b| ix.name(a).cmp(ix.name(b)));
+    listing.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let kind = DIR | SYMLINK;
+    let mut steps = Vec::with_capacity(listing.len());
+    let mut gone = Vec::new();
+    let mut i = 0;
+    for (name, meta, token) in listing {
+        while i < existing.len() && ix.name(existing[i]) < name.as_str() {
+            gone.push(existing[i]);
+            i += 1;
         }
-        let kind = DIR | SYMLINK;
-        let id = match existing.remove(&name) {
-            Some(id) if ix.entry(id).flags & kind == meta.flags & kind => {
+        let found = (i < existing.len() && ix.name(existing[i]) == name).then(|| {
+            i += 1;
+            existing[i - 1]
+        });
+        steps.push(match found {
+            Some(id) if ix.entry(id).flags & kind == meta.flags & kind => Step::Keep(id, meta, token),
+            Some(id) => Step::Replace(id, name, meta, token),
+            None => Step::Add(name, meta, token),
+        });
+    }
+    // Whatever the listing no longer has (excluded folders included) goes.
+    gone.extend_from_slice(&existing[i..]);
+    ix.remove_many(dir, &gone);
+    for step in steps {
+        let (id, token) = match step {
+            Step::Keep(id, meta, token) => {
                 let e = ix.entry(id);
-                if e.mtime() != meta.mtime || (!is_dir && e.size != meta.size) {
+                if e.mtime() != meta.mtime || (meta.flags & DIR == 0 && e.size != meta.size) {
                     ix.update(id, meta.size, meta.mtime);
                 }
-                id
+                (id, token)
             }
-            Some(id) => {
-                ix.remove(id);
-                add_entry(ix, dir, &name, meta)
+            Step::Replace(old, name, meta, token) => {
+                ix.remove(old);
+                (add_entry(ix, dir, &name, meta), token)
             }
-            None => add_entry(ix, dir, &name, meta),
+            Step::Add(name, meta, token) => (add_entry(ix, dir, &name, meta), token),
         };
-        if let Some(c) = child {
-            next.push((id, c));
-        }
+        remember(ids, token, id);
     }
-    let gone: Vec<u32> = existing.into_values().collect();
-    ix.remove_many(dir, &gone);
 }
 
 /// Adds one entry and counts its size in the folders above it.

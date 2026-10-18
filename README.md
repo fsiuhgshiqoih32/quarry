@@ -28,8 +28,8 @@ Get the latest build from the [Releases page](https://github.com/fsiuhgshiqoih32
 | Linux x86_64 | `quarry-<version>-linux-x86_64.tar.gz` or `quarry_<version>_amd64.deb` |
 
 Unzip it and run it. The first index of a large drive takes a minute or so (5.4 million files took
-about 40 seconds in testing); you can search while it runs once a saved index exists, and later
-launches start from the saved index straight away.
+about 40 seconds in testing). Later launches search the saved index straight away and bring it up
+to date in the background.
 
 **Windows:** the exe isn't code-signed, so SmartScreen may warn on first launch. Choose
 "More info", then "Run anyway". The zip also has `quarry-cli.exe`, a console build for scripts.
@@ -122,12 +122,20 @@ as is the second view of the macOS data volume. In Settings you can pick folders
 by full path or by name anywhere (`node_modules`, `*.cache`).
 
 Live updates use the OS's change notifications: ReadDirectoryChangesW on Windows, FSEvents on
-macOS, inotify on Linux. inotify needs one watch per folder, so on Linux live updates cover your
-home folder and an hourly rescan covers the rest (change it in Settings). Quarry also rescans once
-at start-up to catch changes made while it wasn't running.
+macOS, inotify on Linux. If Windows drops events anyway (a burst bigger than its 512 KiB buffer),
+Quarry refreshes that drive. inotify needs one watch per folder; Quarry watches every indexed
+folder, your home folder first. If the system limit runs out, the status bar says so and the
+folders without a watch are refreshed hourly. To raise the limit:
 
-Memory use is roughly 110 bytes per file, so about 110 MB per million files (5.4 million files used
-610 MB in testing).
+```bash
+echo fs.inotify.max_user_watches=1048576 | sudo tee /etc/sysctl.d/90-quarry.conf && sudo sysctl --system
+```
+
+At start-up Quarry brings the saved index up to date in place, folder by folder, to catch changes
+made while it wasn't running. Searches work throughout, and quitting part-way keeps what was done.
+
+Memory use is roughly 75 bytes per file. With 5.4 million files in testing, the index held 330 MB
+after loading and 395 MB after a full scan, and start-up peaked at about 530 MB.
 
 ## Files
 

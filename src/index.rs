@@ -152,6 +152,7 @@ impl Index {
 
     fn rebuild_rank(&mut self) {
         self.rank.clear();
+        self.rank.reserve_exact(self.entries.len());
         self.rank.resize(self.entries.len(), NONE);
         for (pos, &id) in self.by_name.iter().enumerate() {
             self.rank[id as usize] = pos as u32;
@@ -190,6 +191,14 @@ impl Index {
         let name = &name[..end];
         let id = u32::try_from(self.entries.len()).expect("index full");
         let name_off = u32::try_from(self.names.len()).expect("name arena full");
+        // Past a million entries, grow by an eighth instead of doubling: a refresh that adds a
+        // few files to a loaded index would otherwise double its memory.
+        if self.entries.len() == self.entries.capacity() && self.entries.len() >= 1 << 20 {
+            self.entries.reserve_exact(self.entries.len() / 8);
+        }
+        if self.names.len() + name.len() > self.names.capacity() && self.names.len() >= 1 << 24 {
+            self.names.reserve_exact(self.names.len() / 8 + name.len());
+        }
         self.names.push_str(name);
         self.entries.push(Entry {
             name_off,
